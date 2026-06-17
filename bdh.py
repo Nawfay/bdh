@@ -1,5 +1,3 @@
-# Copyright 2025 Pathway Technology, Inc.
-
 import dataclasses
 import math
 

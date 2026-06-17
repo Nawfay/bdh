@@ -1,5 +1,3 @@
-# Copyright Pathway Technology, Inc.
-
 import os
 from contextlib import nullcontext
 
