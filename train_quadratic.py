@@ -9,12 +9,16 @@ Train x's are drawn from [-1, 1]. Eval x's are drawn from [-2, 2] to measure
 extrapolation outside the training domain.
 """
 
+import argparse
+import os
 from contextlib import nullcontext
 
 import bdh
 import numpy as np
 import torch
 import torch.nn.functional as F
+
+CKPT_PATH = os.path.join(os.path.dirname(__file__), "bdh_quadratic.pt")
 
 device = torch.device("mps")
 torch.manual_seed(1337)
@@ -75,28 +79,55 @@ def y_position_mask(seq_len):
 
 
 @torch.no_grad()
-def eval_extrapolation(model, x_low, x_high, n_batches=EVAL_BATCHES):
-    """Average per-token MSE on dequantized y predictions."""
+def eval_extrapolation(model, x_low, x_high, n_batches=EVAL_BATCHES, show_samples=0):
+    """Average per-token MSE on dequantized y predictions.
+
+    If show_samples > 0, print that many (x, y_true, y_pred) rows from the
+    last-position prediction of a few sequences in the first batch, plus the
+    sampled quadratic coefficients for context.
+    """
     model.eval()
     total_mse = 0.0
     total_n = 0
-    for _ in range(n_batches):
-        inp, tgt, _, ys_true = make_batch(BATCH_SIZE, x_low, x_high, return_truth=True)
+    # Track variance baseline: MSE you'd get predicting the per-batch mean of y.
+    baseline_mse = 0.0
+    for b in range(n_batches):
+        inp, tgt, xs, ys_true = make_batch(BATCH_SIZE, x_low, x_high, return_truth=True)
         logits, _ = model(inp)
-        # Positions whose target is a y.
         mask = y_position_mask(inp.size(1))
         y_logits = logits[:, mask, :]                  # B, POINTS_PER_SEQ, 256
         pred_bins = y_logits.argmax(dim=-1).cpu().numpy()
         pred_y = dequantize(pred_bins, Y_MIN, Y_MAX)
-        # ys_true has shape (B, POINTS_PER_SEQ); each corresponds to one y-target.
         mse = ((pred_y - ys_true) ** 2).mean()
         total_mse += float(mse) * BATCH_SIZE
         total_n += BATCH_SIZE
+        baseline_mse += float(ys_true.var()) * BATCH_SIZE
+
+        if b == 0 and show_samples > 0:
+            # Show a few sequences' first / middle / last predictions so you
+            # can see how the model improves as context grows.
+            print(f"  sample predictions for x in [{x_low}, {x_high}]:")
+            for s in range(min(show_samples, BATCH_SIZE)):
+                idxs = [0, pred_y.shape[1] // 2, pred_y.shape[1] - 1]
+                cells = []
+                for i in idxs:
+                    cells.append(
+                        f"x={xs[s, i]:+.2f} y={ys_true[s, i]:+.3f} y_hat={pred_y[s, i]:+.3f}"
+                    )
+                # Per-sample mean abs error across all points in this sequence.
+                seq_mae = float(np.mean(np.abs(pred_y[s] - ys_true[s])))
+                print(f"    seq {s}:  " + "  |  ".join(cells) + f"   (MAE={seq_mae:.3f})")
     model.train()
-    return total_mse / total_n
+    return total_mse / total_n, baseline_mse / total_n
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--ckpt", default=CKPT_PATH, help="checkpoint path")
+    parser.add_argument("--resume", action="store_true", help="resume from --ckpt if it exists")
+    parser.add_argument("--eval-only", action="store_true", help="skip training, just evaluate --ckpt")
+    args = parser.parse_args()
+
     config = bdh.BDHConfig()       # vocab_size=256 is already what we need
     model = bdh.BDH(config).to(device)
     # Note: torch.compile is skipped — Inductor has no MPS backend, so it
@@ -106,8 +137,23 @@ if __name__ == "__main__":
     )
     ctx = nullcontext()
 
+    start_step = 0
+    if (args.resume or args.eval_only) and os.path.exists(args.ckpt):
+        ckpt = torch.load(args.ckpt, map_location=device)
+        model.load_state_dict(ckpt["model"])
+        optimizer.load_state_dict(ckpt["optimizer"])
+        start_step = ckpt.get("step", 0)
+        print(f"loaded checkpoint {args.ckpt} at step {start_step}")
+
+    if args.eval_only:
+        in_mse, in_base = eval_extrapolation(model, x_low=-1.0, x_high=1.0, show_samples=4)
+        ex_mse, ex_base = eval_extrapolation(model, x_low=-2.0, x_high=2.0, show_samples=4)
+        print(f"in-domain  x in [-1, 1]  MSE: {in_mse:.4f}  (variance baseline: {in_base:.4f})")
+        print(f"extrapolat x in [-2, 2]  MSE: {ex_mse:.4f}  (variance baseline: {ex_base:.4f})")
+        raise SystemExit
+
     loss_acc, loss_steps = 0.0, 0
-    for step in range(MAX_ITERS):
+    for step in range(start_step, MAX_ITERS):
         inp, tgt = make_batch(BATCH_SIZE, x_low=-1.0, x_high=1.0)
         with ctx:
             logits, _ = model(inp)
@@ -127,6 +173,12 @@ if __name__ == "__main__":
             avg = loss_acc / max(loss_steps, 1)
             print(f"step {step:4d}/{MAX_ITERS}  train_loss={avg:.4f}")
             loss_acc, loss_steps = 0.0, 0
+
+    torch.save(
+        {"model": model.state_dict(), "optimizer": optimizer.state_dict(), "step": MAX_ITERS},
+        args.ckpt,
+    )
+    print(f"saved checkpoint to {args.ckpt}")
 
     print("\nTraining done. Evaluating MSE on dequantized y predictions.")
     in_domain_mse = eval_extrapolation(model, x_low=-1.0, x_high=1.0)
