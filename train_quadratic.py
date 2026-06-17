@@ -181,8 +181,7 @@ if __name__ == "__main__":
     print(f"saved checkpoint to {args.ckpt}")
 
     print("\nTraining done. Evaluating MSE on dequantized y predictions.")
-    in_domain_mse = eval_extrapolation(model, x_low=-1.0, x_high=1.0)
-    extrap_mse = eval_extrapolation(model, x_low=-2.0, x_high=2.0)
-    # A baseline: predicting the dataset mean of y (~0) gives MSE ~ Var(y).
-    print(f"in-domain  x in [-1, 1]  MSE: {in_domain_mse:.4f}")
-    print(f"extrapolat x in [-2, 2]  MSE: {extrap_mse:.4f}")
+    in_mse, in_base = eval_extrapolation(model, x_low=-1.0, x_high=1.0, show_samples=4)
+    ex_mse, ex_base = eval_extrapolation(model, x_low=-2.0, x_high=2.0, show_samples=4)
+    print(f"in-domain  x in [-1, 1]  MSE: {in_mse:.4f}  (variance baseline: {in_base:.4f})")
+    print(f"extrapolat x in [-2, 2]  MSE: {ex_mse:.4f}  (variance baseline: {ex_base:.4f})")
